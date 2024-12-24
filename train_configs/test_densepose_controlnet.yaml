@@ -1,0 +1,41 @@
+model_name: "flux-dev"
+
+data_config:
+  # Data loader settings for the DensePose dataset
+  train_batch_size: 4      # how many samples per batch
+  num_workers: 4           # number of processes for data loading
+  img_size: 512            # final resolution for each image & segm map
+  images_dir: "/teamspace/studios/this_studio/images"
+  maps_dir: "/teamspace/studios/this_studio/maps"
+  contents_dir: "/teamspace/studios/this_studio/contents"
+
+# Logging & reporting
+report_to: wandb
+tracker_project_name: "densepose_training"
+
+# Training parameters
+train_batch_size: 4         # (Not always the same as data_config.train_batch_size; can be used differently if needed)
+output_dir: "saves_densepose"
+max_train_steps: 100000
+learning_rate: 2e-5
+lr_scheduler: "constant"
+lr_warmup_steps: 10
+adam_beta1: 0.9
+adam_beta2: 0.999
+adam_weight_decay: 0.01
+adam_epsilon: 1e-8
+max_grad_norm: 1.0
+
+# Mixed precision: "fp16", "bf16", or "no" 
+mixed_precision: "bf16"
+
+# Checkpointing
+checkpointing_steps: 2500
+checkpoints_total_limit: 10
+resume_from_checkpoint: "latest"
+
+# Gradient accumulation
+gradient_accumulation_steps: 2
+
+# Logging
+logging_dir: "logs"
