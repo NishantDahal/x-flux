@@ -51,6 +51,7 @@ class XFluxPipeline:
         }
         self.controlnet_loaded = False
         self.ip_loaded = False
+        self.supported_control_types = ["canny", "depth", "hed", "densepose"]
 
     def set_ip(self, local_path: str = None, repo_id = None, name: str = None):
         self.model.to(self.device)
@@ -135,9 +136,16 @@ class XFluxPipeline:
         self.model.to(self.device)
         self.controlnet = load_controlnet(self.model_type, self.device).to(torch.bfloat16)
 
+        # Use load_checkpoint for both local and remote files
         checkpoint = load_checkpoint(local_path, repo_id, name)
         self.controlnet.load_state_dict(checkpoint, strict=False)
-        self.annotator = Annotator(control_type, self.device)
+        
+        # Skip annotator for densepose since input is already processed
+        if control_type != "densepose":
+            self.annotator = Annotator(control_type, self.device)
+        else:
+            self.annotator = None
+            
         self.controlnet_loaded = True
         self.control_type = control_type
 
@@ -192,11 +200,18 @@ class XFluxPipeline:
             image_proj = self.get_image_proj(image_prompt)
             neg_image_proj = self.get_image_proj(neg_image_prompt)
 
-        if self.controlnet_loaded:
-            controlnet_image = self.annotator(controlnet_image, width, height)
-            controlnet_image = torch.from_numpy((np.array(controlnet_image) / 127.5) - 1)
-            controlnet_image = controlnet_image.permute(
-                2, 0, 1).unsqueeze(0).to(torch.bfloat16).to(self.device)
+        if self.controlnet_loaded and controlnet_image is not None:
+            # Resize controlnet_image to match target dimensions
+            controlnet_image = controlnet_image.resize((width, height), Image.LANCZOS)
+            
+            # For densepose, use the input image directly
+            if self.control_type == "densepose":
+                controlnet_image = torch.from_numpy((np.array(controlnet_image) / 127.5) - 1)
+                controlnet_image = controlnet_image.permute(2, 0, 1).unsqueeze(0).to(torch.bfloat16).to(self.device)
+            else:
+                controlnet_image = self.annotator(controlnet_image, width, height)
+                controlnet_image = torch.from_numpy((np.array(controlnet_image) / 127.5) - 1)
+                controlnet_image = controlnet_image.permute(2, 0, 1).unsqueeze(0).to(torch.bfloat16).to(self.device)
 
         return self.forward(
             prompt,

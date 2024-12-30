@@ -16,7 +16,7 @@ import torch.utils.checkpoint
 import transformers
 from accelerate import Accelerator
 from accelerate.logging import get_logger
-from accelerate.state import AcceleratorState
+from accelerate.state import AcceleratorState, DistributedType
 from accelerate.utils import ProjectConfiguration, set_seed
 from huggingface_hub import create_repo, upload_folder
 from packaging import version
@@ -40,6 +40,7 @@ from diffusers.utils.import_utils import is_xformers_available
 from diffusers.utils.torch_utils import is_compiled_module
 from einops import rearrange
 
+# Flux-specific imports
 from src.flux.sampling import denoise, get_noise, get_schedule, prepare, unpack
 from src.flux.util import (
     configs,
@@ -50,12 +51,14 @@ from src.flux.util import (
     load_t5
 )
 
+# IMPORTANT: Using our DensePose dataset loader (adapt if needed)
 from image_datasets.densepose_dataset import loader
 
 if is_wandb_available():
     import wandb
 
 logger = get_logger(__name__, log_level="INFO")
+
 
 def get_models(name: str, device, offload: bool, is_schnell: bool):
     """
@@ -89,7 +92,7 @@ def main():
 
     # 2. Accelerator setup
     accelerator_project_config = ProjectConfiguration(
-        project_dir=args.output_dir, 
+        project_dir=args.output_dir,
         logging_dir=logging_dir
     )
     accelerator = Accelerator(
@@ -105,6 +108,7 @@ def main():
     )
     logger.info(accelerator.state, main_process_only=False)
 
+    # Set library verbosity
     if accelerator.is_local_main_process:
         datasets.utils.logging.set_verbosity_warning()
         transformers.utils.logging.set_verbosity_warning()
@@ -114,37 +118,39 @@ def main():
         transformers.utils.logging.set_verbosity_error()
         diffusers.utils.logging.set_verbosity_error()
 
-    if accelerator.is_main_process:
-        if args.output_dir is not None:
-            os.makedirs(args.output_dir, exist_ok=True)
+    # Create output dir on main process
+    if accelerator.is_main_process and args.output_dir is not None:
+        os.makedirs(args.output_dir, exist_ok=True)
 
     print("DEVICE", accelerator.device)
 
     # 3. Load base FLUX models
     dit, vae, t5, clip = get_models(
-        name=args.model_name, 
-        device=accelerator.device, 
-        offload=False, 
+        name=args.model_name,
+        device=accelerator.device,
+        offload=False,
         is_schnell=is_schnell
     )
+    # Freeze them
     vae.requires_grad_(False)
     t5.requires_grad_(False)
     clip.requires_grad_(False)
     dit.requires_grad_(False)
     dit.to(accelerator.device)
 
+    # 4. Load a ControlNet for FLUX
     controlnet = load_controlnet(
-        name=args.model_name, 
-        device=accelerator.device, 
+        name=args.model_name,
+        device=accelerator.device,
         transformer=dit
     )
     controlnet = controlnet.to(torch.float32)
     controlnet.train()
 
+    # 5. Prepare optimizer
     optimizer_cls = torch.optim.AdamW
-    print(
-        sum([p.numel() for p in controlnet.parameters() if p.requires_grad]) / 1e6, 
-        'parameters (M)'
+    logger.info(
+        f"Trainable ControlNet params: {sum(p.numel() for p in controlnet.parameters() if p.requires_grad) / 1e6:.2f} M"
     )
     optimizer = optimizer_cls(
         [p for p in controlnet.parameters() if p.requires_grad],
@@ -154,8 +160,10 @@ def main():
         eps=args.adam_epsilon,
     )
 
+    # 6. Build dataset loader
     train_dataloader = loader(**args.data_config)
 
+    # 7. Compute training steps
     overrode_max_train_steps = False
     num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
     if args.max_train_steps is None:
@@ -172,6 +180,7 @@ def main():
     global_step = 0
     first_epoch = 0
 
+    # 8. Accelerator prepare
     controlnet, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
         controlnet, optimizer, deepcopy(train_dataloader), lr_scheduler
     )
@@ -189,6 +198,7 @@ def main():
         args.max_train_steps = args.num_train_epochs * num_update_steps_per_epoch
     args.num_train_epochs = math.ceil(args.max_train_steps / num_update_steps_per_epoch)
 
+    # Log setup
     if accelerator.is_main_process:
         accelerator.init_trackers(args.tracker_project_name, {"test": None})
 
@@ -200,14 +210,18 @@ def main():
     logger.info("***** Running training *****")
     logger.info(f"  Num Epochs = {args.num_train_epochs}")
     logger.info(f"  Instantaneous batch size per device = {args.train_batch_size}")
-    logger.info(f"  Total train batch size (w. parallel, distributed & accumulation) = {total_batch_size}")
+    logger.info(
+        f"  Total train batch size (w. parallel, distributed & accumulation) = {total_batch_size}"
+    )
     logger.info(f"  Gradient Accumulation steps = {args.gradient_accumulation_steps}")
     logger.info(f"  Total optimization steps = {args.max_train_steps}")
 
+    # 9. Resume from checkpoint if provided
     if args.resume_from_checkpoint:
         if args.resume_from_checkpoint != "latest":
             path = os.path.basename(args.resume_from_checkpoint)
         else:
+            # Get the most recent checkpoint
             dirs = os.listdir(args.output_dir)
             dirs = [d for d in dirs if d.startswith("checkpoint")]
             dirs = sorted(dirs, key=lambda x: int(x.split("-")[1]))
@@ -228,6 +242,7 @@ def main():
     else:
         initial_global_step = 0
 
+    # Create a progress bar
     progress_bar = tqdm(
         range(0, args.max_train_steps),
         initial=initial_global_step,
@@ -235,6 +250,7 @@ def main():
         disable=not accelerator.is_local_main_process,
     )
 
+    # 10. Training loop
     for epoch in range(first_epoch, args.num_train_epochs):
         train_loss = 0.0
 
@@ -242,9 +258,9 @@ def main():
             with accelerator.accumulate(controlnet):
                 # batch: (original_img, densepose_map, prompt)
                 img, control_image, prompts = batch
-
                 control_image = control_image.to(accelerator.device)
 
+                # Encode original image with VAE
                 with torch.no_grad():
                     x_1 = vae.encode(img.to(accelerator.device).to(torch.float32))
                     inp = prepare(t5=t5, clip=clip, img=x_1, prompt=prompts)
@@ -253,19 +269,22 @@ def main():
                 bs = img.shape[0]
                 t = torch.sigmoid(torch.randn((bs,), device=accelerator.device))
 
+                # Weighted interpolation between x_1 and random x_0
                 x_0 = torch.randn_like(x_1).to(accelerator.device)
                 x_t = (
-                    (1 - t.unsqueeze(1).unsqueeze(2)) * x_1 
+                    (1 - t.unsqueeze(1).unsqueeze(2)) * x_1
                     + t.unsqueeze(1).unsqueeze(2) * x_0
                 )
 
+                # Guidance scale
                 guidance_vec = torch.full(
-                    (x_t.shape[0],), 
-                    4, 
-                    device=x_t.device, 
+                    (x_t.shape[0],),
+                    4,
+                    device=x_t.device,
                     dtype=x_t.dtype
                 )
 
+                # Forward pass through the ControlNet
                 block_res_samples = controlnet(
                     img=x_t.to(weight_dtype),
                     img_ids=inp['img_ids'].to(weight_dtype),
@@ -277,6 +296,7 @@ def main():
                     guidance=guidance_vec.to(weight_dtype),
                 )
 
+                # Predict the noise with main diffusion model
                 model_pred = dit(
                     img=x_t.to(weight_dtype),
                     img_ids=inp['img_ids'].to(weight_dtype),
@@ -290,8 +310,10 @@ def main():
                     guidance=guidance_vec.to(weight_dtype),
                 )
 
+                # Compute MSE loss
                 loss = F.mse_loss(model_pred.float(), (x_0 - x_1).float(), reduction="mean")
 
+                # Backprop & optimizer step
                 avg_loss = accelerator.gather(loss.repeat(args.train_batch_size)).mean()
                 train_loss += avg_loss.item() / args.gradient_accumulation_steps
 
@@ -302,46 +324,81 @@ def main():
                 lr_scheduler.step()
                 optimizer.zero_grad()
 
-            # Logging & checkpointing
+            # If we synchronized gradients, it means we completed an update step
             if accelerator.sync_gradients:
                 progress_bar.update(1)
                 global_step += 1
-                accelerator.log({"train_loss": train_loss}, step=global_step)
+
+                # Log metrics
+                logs = {
+                    "train_loss": train_loss,
+                    "step_loss": loss.detach().item(),
+                    "lr": lr_scheduler.get_last_lr()[0],
+                    "epoch": epoch + 1,
+                    "total_epochs": args.num_train_epochs,
+                }
+                accelerator.log(logs, step=global_step)
+
+                # Reset running loss
                 train_loss = 0.0
 
+                # Checkpointing
                 if global_step % args.checkpointing_steps == 0:
                     if accelerator.is_main_process:
+                        # Possibly remove older checkpoints
                         if args.checkpoints_total_limit is not None:
                             checkpoints = os.listdir(args.output_dir)
-                            checkpoints = [d for d in checkpoints if d.startswith("checkpoint")]
+                            checkpoints = [
+                                d for d in checkpoints if d.startswith("checkpoint")
+                            ]
                             checkpoints = sorted(checkpoints, key=lambda x: int(x.split("-")[1]))
                             if len(checkpoints) >= args.checkpoints_total_limit:
-                                num_to_remove = len(checkpoints) - args.checkpoints_total_limit + 1
+                                num_to_remove = (
+                                    len(checkpoints) - args.checkpoints_total_limit + 1
+                                )
                                 removing_checkpoints = checkpoints[0:num_to_remove]
                                 logger.info(
                                     f"{len(checkpoints)} checkpoints already exist, "
                                     f"removing {len(removing_checkpoints)}."
                                 )
-                                logger.info(f"removing checkpoints: {', '.join(removing_checkpoints)}")
+                                logger.info(
+                                    f"removing checkpoints: {', '.join(removing_checkpoints)}"
+                                )
                                 for removing_checkpoint in removing_checkpoints:
                                     removing_checkpoint = os.path.join(args.output_dir, removing_checkpoint)
                                     shutil.rmtree(removing_checkpoint)
 
+                    # Save checkpoint
                     save_path = os.path.join(args.output_dir, f"checkpoint-{global_step}")
                     accelerator.save_state(save_path)
-                    unwrapped_model = accelerator.unwrap_model(controlnet)
-                    torch.save(unwrapped_model.state_dict(), os.path.join(save_path, 'controlnet.bin'))
+
+                    # ---- FIX START: Avoid unwrap if using DeepSpeed ----
+                    if accelerator.distributed_type == DistributedType.DEEPSPEED:
+                        # If in DeepSpeed mode, just save via state_dict directly
+                        controlnet_state_dict = controlnet.state_dict()
+                        torch.save(controlnet_state_dict, os.path.join(save_path, 'controlnet.bin'))
+                    else:
+                        # Normal unwrap if not using DeepSpeed
+                        unwrapped_model = accelerator.unwrap_model(controlnet)
+                        torch.save(
+                            unwrapped_model.state_dict(),
+                            os.path.join(save_path, 'controlnet.bin')
+                        )
+                    # ---- FIX END ----
+
                     logger.info(f"Saved state to {save_path}")
 
             logs = {
-                "step_loss": loss.detach().item(), 
+                "step_loss": loss.detach().item(),
                 "lr": lr_scheduler.get_last_lr()[0]
             }
             progress_bar.set_postfix(**logs)
 
+            # Stop if we've hit max steps
             if global_step >= args.max_train_steps:
                 break
 
+    # End of training
     accelerator.wait_for_everyone()
     accelerator.end_training()
 
